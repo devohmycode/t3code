@@ -4359,6 +4359,57 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("copies the ignored files that .worktreeinclude names into new worktrees", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, ".gitignore", ".env\nsecrets/\nconfig/local/\nnotes.txt\n");
+        yield* writeTextFile(cwd, "apps/web/index.ts", "export {};\n");
+        yield* git(cwd, ["add", "."]);
+        yield* git(cwd, ["commit", "-m", "ignore local files"]);
+        yield* writeTextFile(
+          cwd,
+          ".worktreeinclude",
+          ".env\nsecrets/\nconfig/local/*.json\nREADME.md\n*.draft\n",
+        );
+        yield* writeTextFile(cwd, ".env", "ROOT=1\n");
+        yield* writeTextFile(cwd, "apps/web/.env", "WEB=1\n");
+        yield* writeTextFile(cwd, "secrets/key.pem", "key\n");
+        yield* writeTextFile(cwd, "config/local/dev.json", "{}\n");
+        yield* writeTextFile(cwd, "config/local/other.txt", "other\n");
+        yield* writeTextFile(cwd, "notes.txt", "notes\n");
+        yield* writeTextFile(cwd, "plan.draft", "untracked but not ignored\n");
+        yield* writeTextFile(cwd, "README.md", "# edited in the source checkout\n");
+
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "include-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/worktree-include",
+        });
+
+        const read = (relativePath: string) =>
+          fileSystem.readFileString(pathService.join(worktreePath, relativePath));
+        const exists = (relativePath: string) =>
+          fileSystem.exists(pathService.join(worktreePath, relativePath));
+        assert.equal(yield* read(".env"), "ROOT=1\n");
+        assert.equal(yield* read("apps/web/.env"), "WEB=1\n");
+        assert.equal(yield* read("secrets/key.pem"), "key\n");
+        assert.equal(yield* read("config/local/dev.json"), "{}\n");
+        assert.isFalse(yield* exists("config/local/other.txt"));
+        assert.isFalse(yield* exists("notes.txt"));
+        assert.isFalse(yield* exists("plan.draft"));
+        assert.equal(yield* read("README.md"), "# test\n");
+      }),
+    );
+
     it.effect("creates worktrees under the configured worktrees directory", () =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
