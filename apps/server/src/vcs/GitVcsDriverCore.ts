@@ -21,6 +21,7 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import ignore from "ignore";
 
 import {
   GitCommandError,
@@ -79,6 +80,8 @@ const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
 const REVIEW_BRANCH_COMMIT_LIMIT = 100;
 const REVIEW_BRANCH_SUBJECT_LIMIT = 300;
 const REVIEW_BRANCH_COMMIT_MAX_OUTPUT_BYTES = 128 * 1024;
+const WORKTREE_INCLUDE_FILE_NAME = ".worktreeinclude";
+const WORKTREE_INCLUDE_LIST_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 // Client patch parsers require a/ and b/ prefixes; override user diff prefix settings.
 export const PATCH_RENDER_PREFIX_ARGS = ["--src-prefix=a/", "--dst-prefix=b/"] as const;
 const REVIEW_DIFF_ARGS = [
@@ -929,6 +932,17 @@ const collectOutput = Effect.fnUntraced(function* (
     truncated,
   };
 });
+
+// Git lists a fully ignored folder as one entry; anchored patterns can still name files inside it.
+const worktreeIncludeFolders = (patterns: string): ReadonlyArray<string> =>
+  patterns.split(/\r?\n/).flatMap((line) => {
+    const pattern = line.trim().replace(/^\/+|\/+$/g, "");
+    if (pattern === "" || pattern.startsWith("#") || pattern.startsWith("!")) return [];
+    const parents = pattern.split("/").slice(0, -1);
+    const firstGlob = parents.findIndex((segment) => /[*?[\\]/.test(segment));
+    const folder = (firstGlob === -1 ? parents : parents.slice(0, firstGlob)).join("/");
+    return folder === "" ? [] : [folder];
+  });
 
 /** Windows Git needs core.longpaths beyond MAX_PATH (260); OS LongPathsEnabled alone is insufficient. */
 export const windowsLongPathConfigEnv = (
@@ -4115,6 +4129,97 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     },
   );
 
+  // Tracked files came with the checkout, so only ignored, untracked ones are copied.
+  const copyWorktreeIncludes = Effect.fn("copyWorktreeIncludes")(function* (
+    cwd: string,
+    worktreePath: string,
+  ) {
+    const exists = (target: string) =>
+      fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false));
+    let sourceRoot = yield* fileSystem
+      .realPath(cwd)
+      .pipe(Effect.orElseSucceed(() => path.resolve(cwd)));
+    // Found on disk: worktree creation keeps its git discovery to the common directory.
+    while (!(yield* exists(path.join(sourceRoot, ".git")))) {
+      // A bare repository is a git directory, with no checkout to copy from.
+      if (
+        (yield* exists(path.join(sourceRoot, "HEAD"))) &&
+        (yield* exists(path.join(sourceRoot, "objects")))
+      ) {
+        return;
+      }
+      const parent = path.dirname(sourceRoot);
+      if (parent === sourceRoot) return;
+      sourceRoot = parent;
+    }
+    const patterns = yield* fileSystem
+      .readFileString(path.join(sourceRoot, WORKTREE_INCLUDE_FILE_NAME))
+      .pipe(Effect.orElseSucceed(() => null));
+    if (patterns === null) return;
+    const matcher = ignore().add(patterns);
+    const isIncluded = (entry: string) => ignore.isPathValid(entry) && matcher.ignores(entry);
+    const listIgnored = (args: readonly string[]) =>
+      executeGit(
+        "GitVcsDriver.createWorktree.listIncludes",
+        sourceRoot,
+        ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", ...args],
+        { maxOutputBytes: WORKTREE_INCLUDE_LIST_MAX_OUTPUT_BYTES },
+      ).pipe(
+        Effect.flatMap((result) =>
+          result.stdoutTruncated
+            ? Effect.fail(
+                new GitCommandError({
+                  operation: "GitVcsDriver.createWorktree.listIncludes",
+                  command: "git ls-files",
+                  cwd: sourceRoot,
+                  detail: "Too many ignored files match .worktreeinclude to copy.",
+                }),
+              )
+            : Effect.succeed(result.stdout.split("\0").filter((entry) => entry.length > 0)),
+        ),
+      );
+    // --directory lists an ignored folder such as node_modules without walking it.
+    const entries = yield* listIgnored(["--directory"]);
+    const anchoredFolders = worktreeIncludeFolders(patterns);
+    const folders = new Set(
+      entries.flatMap((entry) => {
+        if (!entry.endsWith("/")) return [];
+        if (isIncluded(entry)) return [entry];
+        return anchoredFolders.flatMap((folder) =>
+          `${folder}/`.startsWith(entry)
+            ? [`${folder}/`]
+            : entry.startsWith(`${folder}/`)
+              ? [entry]
+              : [],
+        );
+      }),
+    );
+    const nested = yield* Effect.forEach(
+      folders,
+      (folder) => listIgnored(["--", `:(literal)${folder}`]),
+      { concurrency: 4 },
+    );
+    const files = new Set(
+      [...entries.filter((entry) => !entry.endsWith("/")), ...nested.flat()].filter(isIncluded),
+    );
+    yield* Effect.forEach(
+      files,
+      (file) => {
+        const target = path.join(worktreePath, file);
+        return exists(target).pipe(
+          Effect.flatMap((present) =>
+            present
+              ? Effect.void
+              : fileSystem
+                  .makeDirectory(path.dirname(target), { recursive: true })
+                  .pipe(Effect.andThen(fileSystem.copyFile(path.join(sourceRoot, file), target))),
+          ),
+        );
+      },
+      { concurrency: 8, discard: true },
+    );
+  });
+
   const createWorktree: GitVcsDriver.GitVcsDriver["Service"]["createWorktree"] = Effect.fn(
     "createWorktree",
   )(function* (input, options) {
@@ -4281,6 +4386,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         }),
       );
     }
+
+    // Callers run setup scripts once this returns, and those scripts often need these files.
+    yield* copyWorktreeIncludes(input.cwd, worktreePath).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning(".worktreeinclude files were not copied into the worktree", {
+          worktreePath,
+          cause,
+        }),
+      ),
+    );
 
     const newRefName = input.newRefName;
     if (newRefName && base) {
